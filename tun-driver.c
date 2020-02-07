@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <net/if.h>
@@ -7,6 +9,7 @@
 #include <fcntl.h>
 #include "tun-driver.h"
 
+int debug = 0;
 int tun_alloc(char dev[IFNAMSIZ], short flags) {
   // Interface request structure
   struct ifreq ifr;
@@ -48,3 +51,13 @@ int tun_alloc(char dev[IFNAMSIZ], short flags) {
   // Return the file descriptor
   return fileDescriptor;
 }
+
+void do_debug(char *msg, ...) {
+  va_list argp;
+  if (debug) {
+    va_start(argp, msg);
+    vfprintf(stderr, msg, argp);
+    va_end(argp);
+  }
+}
+

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <net/if.h>
 #include <libserialport.h>
 #include <pthread.h>
@@ -20,11 +21,13 @@ char adapterName[IFNAMSIZ];
 char serialPortName[128];
 int serialBaudRate = 9600;
 
+#define BUFFER (16384)
+
 /**
  * Handles getting packets from the serial port and writing them to the TUN interface
  * @param ptr       - Pointer to the CommDevices struct
  */
-void *serialToTun(void *ptr) {
+static void *serialToTun(void *ptr) {
   // Grab thread parameters
   struct CommDevices *args = ptr;
 
@@ -33,8 +36,8 @@ void *serialToTun(void *ptr) {
 
   // Create two buffers, one to store raw data from the serial port and
   // one to store SLIP frames
-  unsigned char inBuffer[4096];
-  unsigned char outBuffer[4096] = {0};
+  unsigned char inBuffer[BUFFER];
+  unsigned char outBuffer[2 * BUFFER] = {0};
   unsigned long outSize = 0;
   int inIndex = 0;
 
@@ -53,36 +56,43 @@ void *serialToTun(void *ptr) {
     // Wait for the event (RX Ready)
     sp_wait(eventSet, 0);
     count = sp_input_waiting(serialPort); // Bytes ready for reading
+    if (count + inIndex > sizeof(inBuffer)) count = sizeof(inBuffer) - inIndex;
+    do_debug("Received %d bytes on serial\n", count);
 
     // Read bytes from serial
     serialResult = sp_blocking_read(serialPort, &inBuffer[inIndex], count, 0);
 
     if (serialResult < 0) {
       fprintf(stderr, "Serial error! %d\n", serialResult);
-    } else {
-      // We need to check if there is an SLIP_END sequence in the new bytes
-      for (unsigned long i = 0; i < serialResult; i++) {
-        if (inBuffer[inIndex] == SLIP_END) {
-          // Decode the packet that is marked by SLIP_END
-          slip_decode(inBuffer, inIndex, outBuffer, 4096, &outSize);
-
-          // Write the packet to the virtual interface
-          write(tunFd, outBuffer, outSize);
-
-          // Copy the remaining data (belonging to the next packet)
-          // to the start of the buffer
-          memcpy(inBuffer, &inBuffer[inIndex + 1], serialResult - i - 1);
-          inIndex = serialResult - i - 1;
-          break;
-        } else {
-          inIndex++;
-        }
-      }
+      return NULL;
     }
+    // We need to check if there is an SLIP_END sequence in the new bytes
+    unsigned char *slip;
+    unsigned char *buffer = inBuffer;
+    inIndex += count;
+    do_debug("Serial buffer: %d\n", (100 * inIndex) / sizeof(inBuffer));
+    while(inIndex > 0 && (slip = memchr(buffer, SLIP_END, inIndex)) != NULL) {
+      slip_decode(buffer, slip - buffer, outBuffer, sizeof(outBuffer), &outSize);
+
+      // Write the packet to the virtual interface
+      int writeResult = write(tunFd, outBuffer, outSize);
+      do_debug("Wrote %d bytes on tun\n", outSize);
+      if (writeResult < 0) {
+          fprintf(stderr, "Tun error! %s(%d)\n", strerror(errno), errno);
+      }
+      inIndex -= slip - buffer + 1;
+      buffer = slip + 1;
+    }
+
+    // Copy the remaining data (belonging to the next packet)
+    // to the start of the buffer
+    memcpy(inBuffer, buffer, inIndex + 1);
+
   }
+  return 0;
 }
 
-void *tunToSerial(void *ptr) {
+static void *tunToSerial(void *ptr) {
   // Grab thread parameters
   struct CommDevices *args = ptr;
 
@@ -90,8 +100,8 @@ void *tunToSerial(void *ptr) {
   struct sp_port *serialPort = args->serialPort;
 
   // Create TUN buffer
-  unsigned char inBuffer[2048];
-  unsigned char outBuffer[4096];
+  unsigned char inBuffer[BUFFER];
+  unsigned char outBuffer[BUFFER * 2];
 
   // Incoming byte count
   ssize_t count;
@@ -107,22 +117,25 @@ void *tunToSerial(void *ptr) {
     if (count < 0) {
       fprintf(stderr, "Could not read from interface\n");
     }
+    do_debug("Received %d bytes on tun\n", count);
 
     // Encode data
-    slip_encode(inBuffer, (unsigned long) count, outBuffer, 4096, &encodedLength);
+    slip_encode(inBuffer, (unsigned long) count, outBuffer, BUFFER * 2, &encodedLength);
 
     // Write to serial port
     serialResult = sp_nonblocking_write(serialPort, outBuffer, encodedLength);
+    do_debug("Wrote %d bytes on serial\n", encodedLength);
     if (serialResult < 0) {
       fprintf(stderr, "Could not send data to serial port: %d\n", serialResult);
     }
   }
+  return NULL;
 }
 
 int main(int argc, char *argv[]) {
   // Grab parameters
   int param;
-  while ((param = getopt(argc, argv, "i:p:b:")) > 0) {
+  while ((param = getopt(argc, argv, "i:p:b:d")) > 0) {
     switch (param) {
       case 'i':
         strncpy(adapterName, optarg, IFNAMSIZ - 1);
@@ -133,6 +146,9 @@ int main(int argc, char *argv[]) {
       case 'b':
         serialBaudRate = atoi(optarg);
         break;
+      case 'd':
+        debug = 1;
+        break;	
       default:
         fprintf(stderr, "Unknown parameter %c\n", param);
         break;

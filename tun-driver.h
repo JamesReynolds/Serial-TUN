@@ -6,3 +6,7 @@
  * @return The file descriptor to communicate with the device
  */
 int tun_alloc(char dev[IFNAMSIZ], short flags);
+
+extern int debug;
+
+void do_debug(char *msg, ...);
